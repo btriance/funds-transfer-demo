@@ -245,7 +245,8 @@ def test_ac7_all_audited_actions(client, login, accounts, db):
     client.post(f"{API}/auth/token", json={"username": "alice", "password": "bad"})
     p = add_bob_payee(client, h)
     transfer(client, h, {"from_account_id": accounts["4012345"]["id"], "payee_id": p["id"], "amount": "1.00"})
-    transfer(client, h, {"from_account_id": accounts["4012345"]["id"], "payee_id": p["id"], "amount": "999999.00"}, key="k2")
+    transfer(client, h, {"from_account_id": accounts["4012346"]["id"], "to_account_id": accounts["4012345"]["id"],
+                         "amount": "999999.00"}, key="k2")
     client.delete(f"{API}/payees/{p['id']}", headers=h)
     client.get(f"{API}/accounts/{accounts['4019876']['id']}", headers=h)
     client.get(f"{API}/accounts/{accounts['4012345']['id']}", headers=login("sam"))

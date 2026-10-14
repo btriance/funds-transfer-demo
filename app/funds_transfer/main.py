@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Optional
 
 import jwt as pyjwt
@@ -9,7 +10,7 @@ from fastapi import APIRouter, Depends, FastAPI, Header, Query, Request, Respons
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -17,22 +18,34 @@ from .audit import audit, configure_logging
 from .config import Settings, get_settings
 from .db import Base, make_engine, make_session_factory
 from .errors import AppError, not_found
-from .models import Account, Payee, Transaction, Transfer, User, utcnow
+from .models import Account, Payee, Transaction, Transfer, User, VerificationChallenge, utcnow
+from .otp import LogOtpSender, OtpSender, code_matches, generate_code, hash_code
 from .money import format_amount, mask_account_number, parse_amount
-from .schemas import PayeeCreate, TokenRequest, TransferCreate, clean_memo
+from .schemas import PayeeCreate, TokenRequest, TransferCreate, VerifyRequest, clean_memo
 from .security import decode_token, hash_password, issue_token, verify_password
 from .seed import seed
 
 bearer = HTTPBearer(auto_error=False)
 _DUMMY_HASH = hash_password("dummy-password-for-timing")
+TORONTO = ZoneInfo("America/Toronto")
+STEP_UP_THRESHOLD_CENTS = 100_000
+OTP_TTL = timedelta(minutes=5)
+OTP_MAX_ATTEMPTS = 3
+COUNTED_STATUSES = ("completed", "pending_verification")
+
+
+def start_of_today_utc() -> datetime:
+    midnight = datetime.now(TORONTO).replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def iso(dt: datetime) -> str:
     return dt.isoformat() + "Z"
 
 
-def create_app(settings: Optional[Settings] = None) -> FastAPI:
+def create_app(settings: Optional[Settings] = None, otp_sender: Optional[OtpSender] = None) -> FastAPI:
     settings = settings or get_settings()
+    otp_sender = otp_sender or LogOtpSender()
     configure_logging()
     engine = make_engine(settings.database_url)
     Base.metadata.create_all(engine)
@@ -130,6 +143,48 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         return {"id": t.id, "from_account_id": t.from_account_id, "to_account_id": t.to_account_id,
                 "payee_id": t.payee_id, "amount": format_amount(t.amount_cents), "memo": t.memo,
                 "status": t.status, "created_at": iso(t.created_at)}
+
+    def expire_stale(db: Session, user_id: str) -> None:
+        stale = list(db.scalars(select(Transfer).join(
+            VerificationChallenge, VerificationChallenge.transfer_id == Transfer.id).where(
+            Transfer.created_by == user_id, Transfer.status == "pending_verification",
+            VerificationChallenge.expires_at <= utcnow())))
+        for t in stale:
+            t.status = "expired"
+        if stale:
+            db.commit()
+
+    def used_today_cents(db: Session, user_id: str, exclude_id: Optional[str] = None) -> int:
+        q = select(func.coalesce(func.sum(Transfer.amount_cents), 0)).where(
+            Transfer.created_by == user_id, Transfer.payee_id.is_not(None),
+            Transfer.status.in_(COUNTED_STATUSES), Transfer.created_at >= start_of_today_utc())
+        if exclude_id:
+            q = q.where(Transfer.id != exclude_id)
+        return int(db.scalar(q))
+
+    def settle(db: Session, transfer: Transfer, src: Account, dst: Account, cents: int) -> bool:
+        """Move funds atomically; returns False (nothing changed) on insufficient funds."""
+        # Conditional update guarantees no overdraft even under concurrent requests.
+        debited = db.execute(update(Account).where(
+            Account.id == src.id, Account.status == "open", Account.balance_cents >= cents,
+        ).values(balance_cents=Account.balance_cents - cents))
+        if debited.rowcount != 1:
+            return False
+        db.execute(update(Account).where(Account.id == dst.id).values(balance_cents=Account.balance_cents + cents))
+        db.flush()
+        src_bal = db.scalar(select(Account.balance_cents).where(Account.id == src.id))
+        dst_bal = db.scalar(select(Account.balance_cents).where(Account.id == dst.id))
+        now = utcnow()
+        db.add_all([
+            Transaction(account_id=src.id, transfer_id=transfer.id, direction="debit", amount_cents=cents,
+                        description=f"Transfer to {mask_account_number(dst.account_number)}",
+                        balance_after_cents=src_bal, created_at=now),
+            Transaction(account_id=dst.id, transfer_id=transfer.id, direction="credit", amount_cents=cents,
+                        description=f"Transfer from {mask_account_number(src.account_number)}",
+                        balance_after_cents=dst_bal, created_at=now),
+        ])
+        transfer.status = "completed"
+        return True
 
     def txn_out(t: Transaction) -> dict:
         return {"id": t.id, "account_id": t.account_id, "transfer_id": t.transfer_id, "direction": t.direction,
@@ -329,34 +384,117 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         if src.status != "open" or dst.status != "open":
             raise fail("ACCOUNT_NOT_OPEN", "Source and destination accounts must be open")
 
-        # Conditional update guarantees no overdraft even under concurrent requests.
-        debited = db.execute(update(Account).where(
-            Account.id == src.id, Account.status == "open", Account.balance_cents >= cents,
-        ).values(balance_cents=Account.balance_cents - cents))
-        if debited.rowcount != 1:
-            raise fail("INSUFFICIENT_FUNDS", "Insufficient funds")
-        db.execute(update(Account).where(Account.id == dst.id).values(balance_cents=Account.balance_cents + cents))
+        if payee is not None:
+            expire_stale(db, user.id)
+            limit = user.daily_payee_limit_cents
+            used = used_today_cents(db, user.id)
+            if used + cents > limit:
+                db.rollback()
+                audit(db, action="transfer_limit_exceeded", outcome="failure", actor_id=user.id,
+                      target_type="account", target_id=src.id, source_ip=ip,
+                      details={"amount": format_amount(cents), "limit": format_amount(limit),
+                               "used_today": format_amount(used)})
+                raise AppError(422, "DAILY_LIMIT_EXCEEDED", "Daily payee transfer limit exceeded")
 
+        needs_step_up = payee is not None and cents >= STEP_UP_THRESHOLD_CENTS
         transfer = Transfer(from_account_id=src.id, to_account_id=dst.id, payee_id=payee.id if payee else None,
-                            amount_cents=cents, memo=memo, status="completed", idempotency_key=idempotency_key,
-                            request_hash=req_hash, created_by=user.id)
+                            amount_cents=cents, memo=memo, status="pending_verification" if needs_step_up else "completed",
+                            idempotency_key=idempotency_key, request_hash=req_hash, created_by=user.id)
         db.add(transfer)
         db.flush()
-        src_bal = db.scalar(select(Account.balance_cents).where(Account.id == src.id))
-        dst_bal = db.scalar(select(Account.balance_cents).where(Account.id == dst.id))
-        now = utcnow()
-        db.add_all([
-            Transaction(account_id=src.id, transfer_id=transfer.id, direction="debit", amount_cents=cents,
-                        description=f"Transfer to {mask_account_number(dst.account_number)}",
-                        balance_after_cents=src_bal, created_at=now),
-            Transaction(account_id=dst.id, transfer_id=transfer.id, direction="credit", amount_cents=cents,
-                        description=f"Transfer from {mask_account_number(src.account_number)}",
-                        balance_after_cents=dst_bal, created_at=now),
-        ])
+
+        if needs_step_up:
+            if src.balance_cents < cents:
+                raise fail("INSUFFICIENT_FUNDS", "Insufficient funds")
+            challenge = VerificationChallenge(transfer_id=transfer.id, code_hash="",
+                                              expires_at=utcnow() + OTP_TTL)
+            db.add(challenge)
+            db.flush()
+            code = generate_code()
+            challenge.code_hash = hash_code(settings.jwt_secret, challenge.id, code)
+            db.commit()
+            otp_sender.send(user.id, code)
+            audit(db, action="step_up_challenge_issued", actor_id=user.id, target_type="transfer",
+                  target_id=transfer.id, source_ip=ip, details={"amount": format_amount(cents)})
+            response.status_code = 202
+            out = transfer_out(transfer)
+            out["verification"] = {"challenge_id": challenge.id, "expires_at": iso(challenge.expires_at)}
+            return out
+
+        if not settle(db, transfer, src, dst, cents):
+            raise fail("INSUFFICIENT_FUNDS", "Insufficient funds")
         db.commit()
         audit(db, action="transfer_created", actor_id=user.id, target_type="transfer", target_id=transfer.id,
               source_ip=ip, details={"amount": format_amount(cents)})
         return transfer_out(transfer)
+
+    @api.post("/transfers/{transfer_id}/verify", tags=["transfers"])
+    def verify_transfer(transfer_id: str, body: VerifyRequest, request: Request,
+                        user: User = Depends(customer_only), db: Session = Depends(get_db)):
+        ip = ip_of(request)
+        t = db.get(Transfer, transfer_id)
+        if t is None:
+            raise not_found("Transfer")
+        if t.created_by != user.id:
+            raise deny_as_not_found(db, user, request, "transfer", transfer_id)
+        expire_stale(db, user.id)
+        db.refresh(t)
+        if t.status == "expired":
+            raise AppError(410, "VERIFICATION_EXPIRED", "Verification code has expired")
+        if t.status != "pending_verification":
+            raise AppError(409, "TRANSFER_NOT_PENDING", "Transfer is not awaiting verification")
+        ch = db.scalar(select(VerificationChallenge).where(VerificationChallenge.transfer_id == t.id))
+        if ch is None or ch.consumed_at is not None:
+            raise AppError(409, "TRANSFER_NOT_PENDING", "Transfer is not awaiting verification")
+
+        if not code_matches(settings.jwt_secret, ch.id, body.code, ch.code_hash):
+            ch.attempts += 1
+            cancelled = ch.attempts >= OTP_MAX_ATTEMPTS
+            if cancelled:
+                t.status = "cancelled"
+            db.commit()
+            audit(db, action="step_up_failed", outcome="failure", actor_id=user.id, target_type="transfer",
+                  target_id=t.id, source_ip=ip, details={"attempts": ch.attempts, "cancelled": cancelled})
+            raise AppError(422, "VERIFICATION_FAILED", "Incorrect verification code")
+
+        # Single-use: only one request can flip consumed_at from NULL.
+        used = db.execute(update(VerificationChallenge).where(
+            VerificationChallenge.id == ch.id, VerificationChallenge.consumed_at.is_(None)
+        ).values(consumed_at=utcnow()))
+        if used.rowcount != 1:
+            db.rollback()
+            raise AppError(409, "TRANSFER_NOT_PENDING", "Transfer is not awaiting verification")
+
+        def cancel(code: str, message: str):
+            t.status = "cancelled"
+            db.commit()
+            audit(db, action="step_up_failed", outcome="failure", actor_id=user.id, target_type="transfer",
+                  target_id=t.id, source_ip=ip, details={"code": code})
+            return AppError(422, code, message)
+
+        if used_today_cents(db, user.id, exclude_id=t.id) + t.amount_cents > user.daily_payee_limit_cents:
+            raise cancel("DAILY_LIMIT_EXCEEDED", "Daily payee transfer limit exceeded")
+        src = db.get(Account, t.from_account_id)
+        dst = db.get(Account, t.to_account_id)
+        if src.status != "open" or dst.status != "open":
+            raise cancel("ACCOUNT_NOT_OPEN", "Source and destination accounts must be open")
+        if not settle(db, t, src, dst, t.amount_cents):
+            raise cancel("INSUFFICIENT_FUNDS", "Insufficient funds")
+        db.commit()
+        audit(db, action="step_up_verified", actor_id=user.id, target_type="transfer", target_id=t.id,
+              source_ip=ip)
+        audit(db, action="transfer_created", actor_id=user.id, target_type="transfer", target_id=t.id,
+              source_ip=ip, details={"amount": format_amount(t.amount_cents)})
+        return transfer_out(t)
+
+    @api.get("/limits", tags=["transfers"])
+    def get_limits(user: User = Depends(customer_only), db: Session = Depends(get_db)):
+        expire_stale(db, user.id)
+        used = used_today_cents(db, user.id)
+        limit = user.daily_payee_limit_cents
+        return {"daily_payee_limit": format_amount(limit), "used_today": format_amount(used),
+                "remaining_today": format_amount(max(limit - used, 0)),
+                "step_up_threshold": format_amount(STEP_UP_THRESHOLD_CENTS)}
 
     @api.get("/transfers/{transfer_id}", tags=["transfers"])
     def get_transfer(transfer_id: str, request: Request, user: User = Depends(any_user),

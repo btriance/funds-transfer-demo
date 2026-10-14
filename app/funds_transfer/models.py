@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import JSON, BigInteger, CheckConstraint, DateTime, ForeignKey, Index, String, UniqueConstraint
+from sqlalchemy import JSON, BigInteger, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
@@ -25,6 +25,7 @@ class User(Base):
     full_name: Mapped[str] = mapped_column(String(128))
     email: Mapped[str] = mapped_column(String(256))
     role: Mapped[str] = mapped_column(String(16))
+    daily_payee_limit_cents: Mapped[int] = mapped_column(BigInteger, default=300_000, server_default="300000")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
@@ -62,10 +63,21 @@ class Transfer(Base):
     payee_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     amount_cents: Mapped[int] = mapped_column(BigInteger)
     memo: Mapped[Optional[str]] = mapped_column(String(140), nullable=True)
-    status: Mapped[str] = mapped_column(String(16))
+    status: Mapped[str] = mapped_column(String(24))
     idempotency_key: Mapped[str] = mapped_column(String(128))
     request_hash: Mapped[str] = mapped_column(String(64))
     created_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class VerificationChallenge(Base):
+    __tablename__ = "verification_challenges"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    transfer_id: Mapped[str] = mapped_column(ForeignKey("transfers.id"), index=True)
+    code_hash: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 

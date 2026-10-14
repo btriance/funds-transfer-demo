@@ -15,6 +15,10 @@ class PayeeCreate(BaseModel):
     account_number: str = Field(pattern=r"^\d{7}$")
 
 
+class VerifyRequest(BaseModel):
+    code: str = Field(pattern=r"^\d{6}$")
+
+
 class TransferCreate(BaseModel):
     from_account_id: str
     to_account_id: Optional[str] = None

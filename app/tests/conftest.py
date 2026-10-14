@@ -10,10 +10,15 @@ PASSWORDS = {"alice": "alice-dev-pw", "bob": "bob-dev-pw", "sam": "sam-dev-pw"}
 
 
 @pytest.fixture()
-def client():
+def otp():
+    return CapturingOtpSender()
+
+
+@pytest.fixture()
+def client(otp):
     settings = Settings(jwt_secret="test-secret-test-secret-test-secret!", database_url="sqlite://",
                         token_ttl_minutes=15)
-    app = create_app(settings)
+    app = create_app(settings, otp_sender=otp)
     with TestClient(app) as c:
         yield c
 
@@ -52,3 +57,11 @@ def balance(db, number):
 def audit_actions(db):
     db.expire_all()
     return [e.action for e in db.scalars(select(AuditEvent))]
+
+
+class CapturingOtpSender:
+    def __init__(self):
+        self.codes = []
+
+    def send(self, user_id, code):
+        self.codes.append(code)

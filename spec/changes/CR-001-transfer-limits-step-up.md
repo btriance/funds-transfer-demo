@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Applies to** | [Funds Transfer Service v1.0](../funds-transfer-spec.md) |
-| **Status** | Proposed |
+| **Status** | Implemented |
 | **Architecture impact** | None. No new components, external dependencies, or trust boundaries. Changes the transfer flow and adds an authentication step. |
 
 ## Why
